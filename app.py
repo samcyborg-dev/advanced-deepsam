@@ -1,6 +1,6 @@
 """
-A+ Market Phase & Supply-Demand Trading System
-Professional TradingView-style implementation with real-time data
+Professional Trading Platform - TradingView Style
+Real-time charts, multi-timeframe analysis, A+ trade setups
 """
 
 import streamlit as st
@@ -14,6 +14,8 @@ import requests
 import time
 import json
 from typing import Dict, List, Tuple, Optional
+import threading
+from collections import deque
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -30,896 +32,183 @@ ASSETS = {
 }
 
 TIMEFRAMES = {
-    '1 Minute': '1m',
-    '5 Minutes': '5m',
-    '15 Minutes': '15m',
-    '30 Minutes': '30m',
-    '1 Hour': '60m',
-    '4 Hours': '240m',
-    '1 Day': '1d'
-}
-
-# TradingView-style color schemes
-COLORS = {
-    'bullish': '#00ff9d',
-    'bearish': '#ff4d4d',
-    'neutral': '#ffaa00',
-    'supply': '#ff3366',
-    'demand': '#33ff66',
-    'background': '#131722',
-    'grid': '#2a2e39',
-    'text': '#d1d4dc'
+    '1m': '1m',
+    '5m': '5m',
+    '15m': '15m',
+    '30m': '30m',
+    '1h': '60m',
+    '4h': '240m',
+    '1d': '1d'
 }
 
 # ============================================================================
-# REAL-TIME DATA MANAGER
+# REAL-TIME DATA STREAM
 # ============================================================================
 
-class RealTimeDataManager:
-    """Manages real-time price updates"""
+class RealTimeDataStream:
+    """Real-time data streaming with WebSocket-like updates"""
     
     def __init__(self):
         self.cache = {}
-        self.last_update = {}
+        self.price_history = deque(maxlen=1000)
+        self.last_update = None
+        self.update_interval = 1  # seconds
         
-    def get_realtime_price(self, symbol: str) -> Dict:
-        """Get real-time price for symbol"""
+    def stream_data(self, symbol: str) -> pd.DataFrame:
+        """Stream real-time data"""
+        try:
+            ticker = yf.Ticker(ASSETS.get(symbol, symbol))
+            
+            # Get latest 5 minutes of data for real-time
+            data = ticker.history(period='5d', interval='1m')
+            
+            if not data.empty:
+                data.columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+                
+                # Add SMA 50
+                data['SMA_50'] = data['Close'].rolling(window=50).mean()
+                
+                # Calculate real-time metrics
+                current_price = data['Close'].iloc[-1]
+                prev_close = data['Close'].iloc[-2] if len(data) > 1 else current_price
+                
+                data['Change'] = data['Close'].pct_change() * 100
+                data['Volume_Change'] = data['Volume'].pct_change() * 100
+                
+                return data
+                
+        except Exception as e:
+            print(f"Stream error: {e}")
+            
+        return pd.DataFrame()
+    
+    def get_realtime_quote(self, symbol: str) -> Dict:
+        """Get current quote"""
         try:
             ticker = yf.Ticker(ASSETS.get(symbol, symbol))
             data = ticker.history(period='1d', interval='1m')
             
             if not data.empty:
                 latest = data.iloc[-1]
-                current_price = latest['Close']
-                
-                # Get bid/ask (approximated)
-                bid = current_price * 0.9999
-                ask = current_price * 1.0001
-                
-                # Calculate daily change
                 daily_open = data.iloc[0]['Open']
-                daily_change = ((current_price - daily_open) / daily_open) * 100
                 
                 return {
-                    'price': current_price,
-                    'bid': bid,
-                    'ask': ask,
-                    'change': daily_change,
+                    'price': latest['Close'],
+                    'bid': latest['Close'] * 0.9999,
+                    'ask': latest['Close'] * 1.0001,
+                    'change': ((latest['Close'] - daily_open) / daily_open) * 100,
                     'high': data['High'].max(),
                     'low': data['Low'].min(),
                     'volume': latest['Volume'],
                     'timestamp': datetime.now()
                 }
-        except Exception as e:
-            print(f"Error fetching real-time price: {e}")
+        except:
+            pass
             
         return None
-        
-    def get_historical_data(self, symbol: str, interval: str, period: str = '1mo') -> pd.DataFrame:
-        """Get historical data with caching"""
-        cache_key = f"{symbol}_{interval}_{period}"
-        
-        # Check cache (5 seconds TTL for real-time, longer for historical)
-        if cache_key in self.cache:
-            cache_time = self.cache[cache_key].get('timestamp', datetime.min)
-            if (datetime.now() - cache_time).seconds < 5:
-                return self.cache[cache_key]['data']
-        
-        try:
-            ticker = ASSETS.get(symbol, symbol)
-            df = yf.download(ticker, period=period, interval=interval, progress=False)
-            
-            if not df.empty:
-                df.columns = ['Open', 'High', 'Low', 'Close', 'Volume']
-                
-                # Add additional indicators
-                df = self._add_indicators(df)
-                
-                self.cache[cache_key] = {
-                    'data': df,
-                    'timestamp': datetime.now()
-                }
-                
-                return df
-                
-        except Exception as e:
-            print(f"Error fetching data: {e}")
-            
-        return pd.DataFrame()
-    
-    def _add_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Add technical indicators"""
-        # Moving Averages
-        df['EMA_9'] = df['Close'].ewm(span=9, adjust=False).mean()
-        df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
-        df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
-        df['SMA_200'] = df['Close'].rolling(window=200).mean()
-        
-        # Bollinger Bands
-        df['BB_Middle'] = df['Close'].rolling(window=20).mean()
-        bb_std = df['Close'].rolling(window=20).std()
-        df['BB_Upper'] = df['BB_Middle'] + (bb_std * 2)
-        df['BB_Lower'] = df['BB_Middle'] - (bb_std * 2)
-        
-        # RSI
-        delta = df['Close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / loss
-        df['RSI'] = 100 - (100 / (1 + rs))
-        
-        # MACD
-        exp1 = df['Close'].ewm(span=12, adjust=False).mean()
-        exp2 = df['Close'].ewm(span=26, adjust=False).mean()
-        df['MACD'] = exp1 - exp2
-        df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
-        df['MACD_Histogram'] = df['MACD'] - df['MACD_Signal']
-        
-        # ATR
-        high_low = df['High'] - df['Low']
-        high_close = abs(df['High'] - df['Close'].shift())
-        low_close = abs(df['Low'] - df['Close'].shift())
-        ranges = pd.concat([high_low, high_close, low_close], axis=1)
-        true_range = np.max(ranges, axis=1)
-        df['ATR'] = true_range.rolling(14).mean()
-        
-        # Volume indicators
-        df['Volume_MA'] = df['Volume'].rolling(window=20).mean()
-        df['Volume_Ratio'] = df['Volume'] / df['Volume_MA']
-        df['OBV'] = (np.sign(df['Close'].diff()) * df['Volume']).fillna(0).cumsum()
-        
-        # Fibonacci Levels (last swing)
-        if len(df) > 50:
-            swing_high = df['High'].iloc[-50:].max()
-            swing_low = df['Low'].iloc[-50:].min()
-            diff = swing_high - swing_low
-            df['Fib_0.236'] = swing_high - diff * 0.236
-            df['Fib_0.382'] = swing_high - diff * 0.382
-            df['Fib_0.5'] = swing_high - diff * 0.5
-            df['Fib_0.618'] = swing_high - diff * 0.618
-            df['Fib_0.786'] = swing_high - diff * 0.786
-        
-        return df
 
 # ============================================================================
-# MARKET PHASE DETECTOR
+# PROFESSIONAL CHART ENGINE
 # ============================================================================
 
-def detect_market_phase(df: pd.DataFrame) -> Dict:
-    """Detect market phase based on your playbook definitions"""
-    if len(df) < 50:
-        return {'phase': 'Unknown', 'confidence': 0, 'location': 'mid', 'liquidity_swept': False, 'structure_broken': False, 'price_position': 0.5, 'momentum': 0, 'volatility': 0}
-    
-    # Get recent data
-    recent = df.tail(50)
-    current_price = df['Close'].iloc[-1]
-    
-    # Calculate price range and position
-    range_high = recent['High'].max()
-    range_low = recent['Low'].min()
-    price_range = range_high - range_low
-    
-    if price_range > 0:
-        price_position = (current_price - range_low) / price_range
-    else:
-        price_position = 0.5
-    
-    # Location classification
-    if price_position < 0.3:
-        location = 'discount'
-    elif price_position > 0.7:
-        location = 'premium'
-    else:
-        location = 'mid'
-    
-    # Calculate momentum
-    momentum = (df['Close'].iloc[-1] - df['Close'].iloc[-20]) / df['Close'].iloc[-20] * 100
-    
-    # Calculate volatility
-    volatility = df['Returns'].std() * 100 if 'Returns' in df.columns else 1
-    
-    # Phase detection logic
-    phase = 'Consolidation'
-    confidence = 0.5
-    
-    # Accumulation detection
-    if location == 'discount' and abs(momentum) < 2 and volatility < 1.5:
-        phase = 'Accumulation'
-        confidence = 0.7 + (1 - price_position) * 0.3
-    # Distribution detection
-    elif location == 'premium' and abs(momentum) < 2 and volatility < 1.5:
-        phase = 'Distribution'
-        confidence = 0.7 + (price_position - 0.7) * 0.3
-    # Markup detection
-    elif momentum > 3 and volatility > 1:
-        phase = 'Markup'
-        confidence = min(0.9, 0.6 + momentum / 20)
-    # Markdown detection
-    elif momentum < -3 and volatility > 1:
-        phase = 'Markdown'
-        confidence = min(0.9, 0.6 + abs(momentum) / 20)
-    
-    # Liquidity sweep detection
-    liquidity_swept = False
-    if len(df) > 10:
-        recent_highs = df['High'].iloc[-10:-1].max()
-        if df['High'].iloc[-1] > recent_highs:
-            if df['Close'].iloc[-1] < df['Close'].iloc[-2]:
-                liquidity_swept = True
-        recent_lows = df['Low'].iloc[-10:-1].min()
-        if df['Low'].iloc[-1] < recent_lows:
-            if df['Close'].iloc[-1] > df['Close'].iloc[-2]:
-                liquidity_swept = True
-    
-    # Structure break detection
-    structure_broken = False
-    if len(df) > 20:
-        if df['High'].iloc[-1] > df['High'].iloc[-10:-1].max() and df['Close'].iloc[-1] > df['EMA_20'].iloc[-1]:
-            structure_broken = True
-        elif df['Low'].iloc[-1] < df['Low'].iloc[-10:-1].min() and df['Close'].iloc[-1] < df['EMA_20'].iloc[-1]:
-            structure_broken = True
-    
-    return {
-        'phase': phase,
-        'confidence': confidence,
-        'location': location,
-        'liquidity_swept': liquidity_swept,
-        'structure_broken': structure_broken,
-        'price_position': price_position,
-        'momentum': momentum,
-        'volatility': volatility
-    }
-
-# ============================================================================
-# ENHANCED SUPPLY & DEMAND ZONES
-# ============================================================================
-
-def find_enhanced_zones(df: pd.DataFrame) -> Tuple[List[Dict], List[Dict]]:
-    """Enhanced supply/demand zone detection with volume confirmation"""
-    supply_zones = []
-    demand_zones = []
-    
-    if len(df) < 30:
-        return supply_zones, demand_zones
-    
-    # Detect swing points
-    swing_highs = []
-    swing_lows = []
-    
-    for i in range(5, len(df) - 5):
-        # Swing high
-        if df['High'].iloc[i] == df['High'].iloc[i-5:i+5].max():
-            swing_highs.append({
-                'price': df['High'].iloc[i],
-                'index': i,
-                'volume': df['Volume'].iloc[i],
-                'time': df.index[i]
-            })
-        
-        # Swing low
-        if df['Low'].iloc[i] == df['Low'].iloc[i-5:i+5].min():
-            swing_lows.append({
-                'price': df['Low'].iloc[i],
-                'index': i,
-                'volume': df['Volume'].iloc[i],
-                'time': df.index[i]
-            })
-    
-    # Identify demand zones
-    for low in swing_lows:
-        if low['volume'] > df['Volume'].iloc[max(0, low['index']-10):low['index']].mean() * 1.5:
-            zone = {
-                'price': low['price'],
-                'lower': low['price'] * 0.998,
-                'upper': low['price'] * 1.002,
-                'strength': min(1.0, low['volume'] / df['Volume'].mean()),
-                'time': low['time'],
-                'touches': 1
-            }
-            
-            # Check if price has returned to this zone
-            recent_prices = df['Low'].iloc[-20:]
-            if any(abs(p - low['price']) / low['price'] < 0.005 for p in recent_prices):
-                zone['strength'] *= 1.2
-                
-            demand_zones.append(zone)
-    
-    # Identify supply zones
-    for high in swing_highs:
-        if high['volume'] > df['Volume'].iloc[max(0, high['index']-10):high['index']].mean() * 1.5:
-            zone = {
-                'price': high['price'],
-                'lower': high['price'] * 0.998,
-                'upper': high['price'] * 1.002,
-                'strength': min(1.0, high['volume'] / df['Volume'].mean()),
-                'time': high['time'],
-                'touches': 1
-            }
-            
-            # Check if price has returned to this zone
-            recent_prices = df['High'].iloc[-20:]
-            if any(abs(p - high['price']) / high['price'] < 0.005 for p in recent_prices):
-                zone['strength'] *= 1.2
-                
-            supply_zones.append(zone)
-    
-    # Sort by strength
-    supply_zones.sort(key=lambda x: x['strength'], reverse=True)
-    demand_zones.sort(key=lambda x: x['strength'], reverse=True)
-    
-    return supply_zones[:5], demand_zones[:5]
-
-# ============================================================================
-# MARKET ANALYZER
-# ============================================================================
-
-class MarketAnalyzer:
-    """Advanced market analysis with institutional concepts"""
-    
-    def __init__(self, df: pd.DataFrame):
-        self.df = df
-        
-    def detect_order_flow(self) -> Dict:
-        """Detect order flow and institutional activity"""
-        if len(self.df) < 20:
-            return {}
-            
-        recent = self.df.tail(20)
-        
-        # Detect absorption
-        absorption = False
-        if len(recent) > 5:
-            price_range = recent['High'].max() - recent['Low'].min()
-            avg_volume = recent['Volume'].mean()
-            volume_spike = recent['Volume'].iloc[-1] > avg_volume * 1.5
-            
-            if volume_spike and price_range / recent['Close'].iloc[-1] < 0.005:
-                absorption = True
-        
-        # Detect exhaustion
-        exhaustion = False
-        if len(recent) > 10:
-            price_move = abs(recent['Close'].iloc[-1] - recent['Close'].iloc[-10]) / recent['Close'].iloc[-10]
-            volume_trend = recent['Volume'].iloc[-5:].mean() / recent['Volume'].iloc[-10:-5].mean()
-            
-            if price_move > 0.02 and volume_trend < 0.8:
-                exhaustion = True
-        
-        # Detect accumulation/distribution
-        ad_line = (self.df['Close'] - self.df['Low'] - (self.df['High'] - self.df['Close'])) / (self.df['High'] - self.df['Low']) * self.df['Volume']
-        ad_line = ad_line.replace([np.inf, -np.inf], 0).fillna(0)
-        ad_trend = ad_line.iloc[-20:].mean() - ad_line.iloc[-40:-20].mean() if len(ad_line) > 40 else 0
-        
-        accumulation = ad_trend > 0 and self.df['Close'].iloc[-1] < self.df['Close'].iloc[-20] if len(self.df) > 20 else False
-        distribution = ad_trend < 0 and self.df['Close'].iloc[-1] > self.df['Close'].iloc[-20] if len(self.df) > 20 else False
-        
-        return {
-            'absorption': absorption,
-            'exhaustion': exhaustion,
-            'accumulation': accumulation,
-            'distribution': distribution,
-            'ad_line': ad_line.iloc[-1] if len(ad_line) > 0 else 0
-        }
-    
-    def detect_imbalances(self) -> List[Dict]:
-        """Detect market imbalances and inefficiencies"""
-        imbalances = []
-        
-        for i in range(1, len(self.df) - 1):
-            candle = self.df.iloc[i]
-            prev_candle = self.df.iloc[i-1]
-            
-            # Bullish imbalance
-            if candle['Low'] > prev_candle['High'] and candle['Volume'] > self.df['Volume'].iloc[i-5:i].mean() * 1.2:
-                imbalances.append({
-                    'type': 'bullish',
-                    'price': prev_candle['High'],
-                    'gap': candle['Low'] - prev_candle['High'],
-                    'time': candle.name
-                })
-            
-            # Bearish imbalance
-            elif candle['High'] < prev_candle['Low'] and candle['Volume'] > self.df['Volume'].iloc[i-5:i].mean() * 1.2:
-                imbalances.append({
-                    'type': 'bearish',
-                    'price': prev_candle['Low'],
-                    'gap': prev_candle['Low'] - candle['High'],
-                    'time': candle.name
-                })
-        
-        return imbalances[-10:]
-
-# ============================================================================
-# ENHANCED SETUP GENERATOR
-# ============================================================================
-
-def generate_enhanced_setups(df: pd.DataFrame, asset: str, phase_data: Dict) -> List[Dict]:
-    """Enhanced trade setup generation with institutional concepts"""
-    setups = []
-    
-    # Hard filters from playbook
-    if phase_data['confidence'] < 0.6:
-        return setups
-    
-    if not phase_data['liquidity_swept']:
-        return setups
-    
-    if not phase_data['structure_broken']:
-        return setups
-    
-    current_price = df['Close'].iloc[-1]
-    atr = df['ATR'].iloc[-1] if 'ATR' in df.columns else current_price * 0.01
-    
-    # Get supply/demand zones
-    supply_zones, demand_zones = find_enhanced_zones(df)
-    
-    # Get order flow analysis
-    analyzer = MarketAnalyzer(df)
-    order_flow = analyzer.detect_order_flow()
-    
-    # LONG SETUP
-    if phase_data['location'] == 'discount' and phase_data['phase'] in ['Accumulation', 'Markup']:
-        if demand_zones:
-            best_demand = demand_zones[0]
-            
-            # Check if price is near demand zone
-            distance_to_zone = abs(current_price - best_demand['price']) / current_price
-            
-            if distance_to_zone < 0.02:
-                entry = current_price
-                stop = best_demand['lower'] * 0.995
-                
-                recent_high = df['High'].iloc[-20:].max()
-                target1 = recent_high
-                target2 = recent_high + atr
-                
-                risk = entry - stop
-                reward1 = target1 - entry
-                
-                if risk > 0:
-                    rr_ratio = reward1 / risk
-                    
-                    if rr_ratio >= 2:
-                        confidence = phase_data['confidence']
-                        
-                        if best_demand['strength'] * 0.1:
-                            confidence += 0.1
-                        if order_flow.get('absorption'):
-                            confidence += 0.1
-                        if order_flow.get('accumulation'):
-                            confidence += 0.1
-                        if 'RSI' in df.columns and df['RSI'].iloc[-1] < 40:
-                            confidence += 0.05
-                        
-                        setups.append({
-                            'direction': 'LONG',
-                            'entry': entry,
-                            'stop_loss': stop,
-                            'take_profit': target1,
-                            'take_profit_2': target2,
-                            'risk_reward': rr_ratio,
-                            'confidence': min(0.95, confidence),
-                            'zone_price': best_demand['price'],
-                            'zone_strength': best_demand['strength'],
-                            'order_flow': order_flow
-                        })
-    
-    # SHORT SETUP
-    elif phase_data['location'] == 'premium' and phase_data['phase'] in ['Distribution', 'Markdown']:
-        if supply_zones:
-            best_supply = supply_zones[0]
-            
-            # Check if price is near supply zone
-            distance_to_zone = abs(current_price - best_supply['price']) / current_price
-            
-            if distance_to_zone < 0.02:
-                entry = current_price
-                stop = best_supply['upper'] * 1.005
-                
-                recent_low = df['Low'].iloc[-20:].min()
-                target1 = recent_low
-                target2 = recent_low - atr
-                
-                risk = stop - entry
-                reward1 = entry - target1
-                
-                if risk > 0:
-                    rr_ratio = reward1 / risk
-                    
-                    if rr_ratio >= 2:
-                        confidence = phase_data['confidence']
-                        
-                        if best_supply['strength'] * 0.1:
-                            confidence += 0.1
-                        if order_flow.get('exhaustion'):
-                            confidence += 0.1
-                        if order_flow.get('distribution'):
-                            confidence += 0.1
-                        if 'RSI' in df.columns and df['RSI'].iloc[-1] > 60:
-                            confidence += 0.05
-                        
-                        setups.append({
-                            'direction': 'SHORT',
-                            'entry': entry,
-                            'stop_loss': stop,
-                            'take_profit': target1,
-                            'take_profit_2': target2,
-                            'risk_reward': rr_ratio,
-                            'confidence': min(0.95, confidence),
-                            'zone_price': best_supply['price'],
-                            'zone_strength': best_supply['strength'],
-                            'order_flow': order_flow
-                        })
-    
-    return setups
-
-# ============================================================================
-# TELEGRAM ALERTS
-# ============================================================================
-
-def send_telegram_alert(bot_token: str, chat_id: str, setup: Dict, asset: str) -> bool:
-    """Send trade alert via Telegram"""
-    if not bot_token or not chat_id or bot_token == 'YOUR_BOT_TOKEN':
-        return False
-    
-    emoji = "🟢" if setup['direction'] == 'LONG' else "🔴"
-    
-    message = f"""
-{emoji} <b>A+ TRADE SETUP ALERT</b>
-━━━━━━━━━━━━━━━━━━━
-
-<b>Asset:</b> {asset}
-<b>Direction:</b> {setup['direction']}
-<b>Entry:</b> ${setup['entry']:.2f}
-<b>Stop Loss:</b> ${setup['stop_loss']:.2f}
-<b>Take Profit:</b> ${setup['take_profit']:.2f}
-
-<b>Risk/Reward:</b> 1:{setup['risk_reward']:.1f}
-<b>Confidence:</b> {setup['confidence']:.0%}
-
-━━━━━━━━━━━━━━━━━━━
-<i>"Discipline over emotion. Wait for the market to invite you."</i>
-"""
-    
-    try:
-        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-        payload = {
-            'chat_id': chat_id,
-            'text': message,
-            'parse_mode': 'HTML'
-        }
-        response = requests.post(url, json=payload, timeout=10)
-        return response.status_code == 200
-    except:
-        return False
-
-# ============================================================================
-# TRADINGVIEW-STYLE CHART
-# ============================================================================
-
-class TradingViewChart:
-    """Create TradingView-style professional charts"""
+class ProfessionalChart:
+    """TradingView-style professional chart engine"""
     
     def __init__(self, df: pd.DataFrame, asset: str):
         self.df = df
         self.asset = asset
+        self.chart_type = 'candlestick'  # candlestick, line, area
+        self.chart_theme = 'dark'
         
-    def create_candlestick_chart(self, supply_zones=None, demand_zones=None, 
-                                  setups=None, show_indicators=True) -> go.Figure:
-        """Create main candlestick chart with indicators"""
+    def create_chart(self, show_sma: bool = True, 
+                     show_volume: bool = True,
+                     chart_type: str = 'candlestick',
+                     zoom_level: int = 100) -> go.Figure:
+        """Create professional chart with interactive controls"""
         
-        # Calculate row heights based on indicators
-        if show_indicators:
-            rows = 4
-            row_heights = [0.5, 0.2, 0.15, 0.15]
+        # Create figure
+        if show_volume:
+            fig = make_subplots(
+                rows=2, cols=1,
+                shared_xaxes=True,
+                vertical_spacing=0.03,
+                row_heights=[0.7, 0.3]
+            )
         else:
-            rows = 1
-            row_heights = [1]
+            fig = make_subplots(rows=1, cols=1)
         
-        fig = make_subplots(
-            rows=rows, cols=1,
-            shared_xaxes=True,
-            vertical_spacing=0.03,
-            row_heights=row_heights,
-            subplot_titles=('Price Action', 'Volume', 'RSI', 'MACD')
-        )
+        # Chart styling based on theme
+        bg_color = '#131722' if self.chart_theme == 'dark' else '#ffffff'
+        grid_color = '#2a2e39' if self.chart_theme == 'dark' else '#e0e0e0'
+        text_color = '#d1d4dc' if self.chart_theme == 'dark' else '#000000'
         
-        # MAIN PRICE CHART
-        fig.add_trace(
-            go.Candlestick(
-                x=self.df.index,
-                open=self.df['Open'],
-                high=self.df['High'],
-                low=self.df['Low'],
-                close=self.df['Close'],
-                name='Price',
-                increasing=dict(line=dict(color='#00ff9d', width=1), fillcolor='#00ff9d'),
-                decreasing=dict(line=dict(color='#ff4d4d', width=1), fillcolor='#ff4d4d'),
-                showlegend=True
-            ),
-            row=1, col=1
-        )
-        
-        # Moving Averages
-        fig.add_trace(
-            go.Scatter(
-                x=self.df.index,
-                y=self.df['EMA_9'],
-                name='EMA 9',
-                line=dict(color='#ffaa00', width=1.5),
-                opacity=0.8
-            ),
-            row=1, col=1
-        )
-        
-        fig.add_trace(
-            go.Scatter(
-                x=self.df.index,
-                y=self.df['EMA_20'],
-                name='EMA 20',
-                line=dict(color='#00ff9d', width=1.5),
-                opacity=0.8
-            ),
-            row=1, col=1
-        )
-        
-        fig.add_trace(
-            go.Scatter(
-                x=self.df.index,
-                y=self.df['EMA_50'],
-                name='EMA 50',
-                line=dict(color='#ffaa66', width=1.5),
-                opacity=0.8
-            ),
-            row=1, col=1
-        )
-        
-        if 'SMA_200' in self.df.columns and not self.df['SMA_200'].isna().all():
+        # Price chart based on type
+        if chart_type == 'candlestick':
+            fig.add_trace(
+                go.Candlestick(
+                    x=self.df.index,
+                    open=self.df['Open'],
+                    high=self.df['High'],
+                    low=self.df['Low'],
+                    close=self.df['Close'],
+                    name='Price',
+                    increasing=dict(line=dict(color='#00ff9d', width=1), fillcolor='#00ff9d'),
+                    decreasing=dict(line=dict(color='#ff4d4d', width=1), fillcolor='#ff4d4d'),
+                    showlegend=True
+                ),
+                row=1, col=1 if show_volume else 1
+            )
+        elif chart_type == 'line':
             fig.add_trace(
                 go.Scatter(
                     x=self.df.index,
-                    y=self.df['SMA_200'],
-                    name='SMA 200',
-                    line=dict(color='#aa66ff', width=2, dash='dash'),
-                    opacity=0.7
+                    y=self.df['Close'],
+                    name='Price',
+                    line=dict(color='#00ff9d', width=2),
+                    fill='tozeroy' if chart_type == 'area' else None,
+                    fillcolor='rgba(0, 255, 157, 0.1)'
                 ),
-                row=1, col=1
+                row=1, col=1 if show_volume else 1
             )
         
-        # Bollinger Bands
-        if 'BB_Upper' in self.df.columns:
+        # Add SMA 50
+        if show_sma and 'SMA_50' in self.df.columns:
             fig.add_trace(
                 go.Scatter(
                     x=self.df.index,
-                    y=self.df['BB_Upper'],
-                    name='BB Upper',
-                    line=dict(color='#888888', width=1, dash='dot'),
-                    opacity=0.5
+                    y=self.df['SMA_50'],
+                    name='SMA 50',
+                    line=dict(color='#ffaa00', width=2),
+                    opacity=0.8
                 ),
-                row=1, col=1
+                row=1, col=1 if show_volume else 1
             )
+        
+        # Volume chart
+        if show_volume:
+            volume_colors = ['#33ff66' if self.df['Close'].iloc[i] >= self.df['Open'].iloc[i] 
+                           else '#ff3366' for i in range(len(self.df))]
             
             fig.add_trace(
-                go.Scatter(
+                go.Bar(
                     x=self.df.index,
-                    y=self.df['BB_Lower'],
-                    name='BB Lower',
-                    line=dict(color='#888888', width=1, dash='dot'),
-                    opacity=0.5,
-                    fill='tonexty',
-                    fillcolor='rgba(136, 136, 136, 0.1)'
-                ),
-                row=1, col=1
-            )
-        
-        # Fibonacci Levels
-        if 'Fib_0.236' in self.df.columns:
-            for level, color in [('Fib_0.236', '#888888'), ('Fib_0.382', '#888888'), 
-                                  ('Fib_0.5', '#ffaa00'), ('Fib_0.618', '#888888'), 
-                                  ('Fib_0.786', '#888888')]:
-                if level in self.df.columns:
-                    fig.add_trace(
-                        go.Scatter(
-                            x=self.df.index,
-                            y=self.df[level],
-                            name=level.replace('_', ' '),
-                            line=dict(color=color, width=1, dash='dash'),
-                            opacity=0.5,
-                            visible='legendonly'
-                        ),
-                        row=1, col=1
-                    )
-        
-        # Supply Zones
-        if supply_zones:
-            for zone in supply_zones[:5]:
-                fig.add_hrect(
-                    y0=zone['lower'],
-                    y1=zone['upper'],
-                    fillcolor='#ff3366',
-                    opacity=0.15,
-                    line_width=1,
-                    line_color='#ff3366',
-                    line_dash='dash',
-                    name=f"Supply Zone (Strength: {zone['strength']:.0%})",
-                    row=1, col=1
-                )
-                
-                fig.add_annotation(
-                    x=zone['time'],
-                    y=zone['upper'],
-                    text=f"🔴 SUPPLY",
-                    showarrow=True,
-                    arrowhead=1,
-                    arrowcolor='#ff3366',
-                    font=dict(size=10, color='#ff3366'),
-                    bgcolor='rgba(0,0,0,0.5)',
-                    row=1, col=1
-                )
-        
-        # Demand Zones
-        if demand_zones:
-            for zone in demand_zones[:5]:
-                fig.add_hrect(
-                    y0=zone['lower'],
-                    y1=zone['upper'],
-                    fillcolor='#33ff66',
-                    opacity=0.15,
-                    line_width=1,
-                    line_color='#33ff66',
-                    line_dash='dash',
-                    name=f"Demand Zone (Strength: {zone['strength']:.0%})",
-                    row=1, col=1
-                )
-                
-                fig.add_annotation(
-                    x=zone['time'],
-                    y=zone['lower'],
-                    text=f"🟢 DEMAND",
-                    showarrow=True,
-                    arrowhead=1,
-                    arrowcolor='#33ff66',
-                    font=dict(size=10, color='#33ff66'),
-                    bgcolor='rgba(0,0,0,0.5)',
-                    row=1, col=1
-                )
-        
-        # Trade Setups
-        if setups:
-            for setup in setups:
-                arrow_color = '#33ff66' if setup['direction'] == 'LONG' else '#ff3366'
-                
-                fig.add_trace(
-                    go.Scatter(
-                        x=[self.df.index[-1]],
-                        y=[setup['entry']],
-                        mode='markers+text',
-                        marker=dict(
-                            symbol='triangle-up' if setup['direction'] == 'LONG' else 'triangle-down',
-                            size=15,
-                            color=arrow_color,
-                            line=dict(color='white', width=1)
-                        ),
-                        text=[f"{setup['direction']} @ {setup['entry']:.2f}"],
-                        textposition='top center',
-                        textfont=dict(size=12, color=arrow_color),
-                        name=f"{setup['direction']} Setup",
-                        showlegend=True
-                    ),
-                    row=1, col=1
-                )
-                
-                fig.add_hline(
-                    y=setup['entry'],
-                    line_dash="dash",
-                    line_color=arrow_color,
-                    opacity=0.7,
-                    row=1, col=1
-                )
-                
-                fig.add_hline(
-                    y=setup['stop_loss'],
-                    line_dash="dash",
-                    line_color='#ff4d4d',
-                    opacity=0.7,
-                    row=1, col=1
-                )
-                
-                fig.add_hline(
-                    y=setup['take_profit'],
-                    line_dash="dash",
-                    line_color='#00ff9d',
-                    opacity=0.7,
-                    row=1, col=1
-                )
-        
-        # VOLUME CHART
-        volume_colors = ['#33ff66' if self.df['Close'].iloc[i] >= self.df['Open'].iloc[i] 
-                         else '#ff3366' for i in range(len(self.df))]
-        
-        fig.add_trace(
-            go.Bar(
-                x=self.df.index,
-                y=self.df['Volume'],
-                name='Volume',
-                marker_color=volume_colors,
-                opacity=0.7,
-                showlegend=True
-            ),
-            row=2, col=1
-        )
-        
-        if 'Volume_MA' in self.df.columns:
-            fig.add_trace(
-                go.Scatter(
-                    x=self.df.index,
-                    y=self.df['Volume_MA'],
-                    name='Volume MA',
-                    line=dict(color='#ffaa00', width=1.5, dash='dash'),
-                    opacity=0.8
+                    y=self.df['Volume'],
+                    name='Volume',
+                    marker_color=volume_colors,
+                    opacity=0.7
                 ),
                 row=2, col=1
             )
         
-        # RSI CHART
-        fig.add_trace(
-            go.Scatter(
-                x=self.df.index,
-                y=self.df['RSI'],
-                name='RSI',
-                line=dict(color='#aa66ff', width=2),
-                fill='tozeroy',
-                fillcolor='rgba(170, 102, 255, 0.1)'
-            ),
-            row=3, col=1
-        )
-        
-        fig.add_hline(y=70, line_dash="dash", line_color="#ff4d4d", opacity=0.5, row=3, col=1)
-        fig.add_hline(y=30, line_dash="dash", line_color="#33ff66", opacity=0.5, row=3, col=1)
-        fig.add_hline(y=50, line_dash="dot", line_color="#888888", opacity=0.5, row=3, col=1)
-        
-        # MACD CHART
-        fig.add_trace(
-            go.Scatter(
-                x=self.df.index,
-                y=self.df['MACD'],
-                name='MACD',
-                line=dict(color='#00ff9d', width=1.5)
-            ),
-            row=4, col=1
-        )
-        
-        fig.add_trace(
-            go.Scatter(
-                x=self.df.index,
-                y=self.df['MACD_Signal'],
-                name='Signal',
-                line=dict(color='#ffaa00', width=1.5)
-            ),
-            row=4, col=1
-        )
-        
-        colors_macd = ['#33ff66' if val >= 0 else '#ff3366' for val in self.df['MACD_Histogram']]
-        fig.add_trace(
-            go.Bar(
-                x=self.df.index,
-                y=self.df['MACD_Histogram'],
-                name='Histogram',
-                marker_color=colors_macd,
-                opacity=0.7
-            ),
-            row=4, col=1
-        )
-        
-        # Chart styling
+        # Update layout with professional styling
         fig.update_layout(
-            template='plotly_dark',
-            paper_bgcolor='#131722',
-            plot_bgcolor='#131722',
-            font=dict(color='#d1d4dc', size=12),
+            template='plotly_dark' if self.chart_theme == 'dark' else 'plotly_white',
+            paper_bgcolor=bg_color,
+            plot_bgcolor=bg_color,
+            font=dict(color=text_color, size=12),
             title={
-                'text': f'{self.asset} - TradingView Style Chart',
-                'font': {'size': 20, 'color': '#d1d4dc'},
+                'text': f'{self.asset} - Interactive Chart',
+                'font': {'size': 20, 'color': text_color},
                 'x': 0.5,
                 'xanchor': 'center'
             },
@@ -933,109 +222,359 @@ class TradingViewChart:
                 bgcolor='rgba(0,0,0,0.7)',
                 font=dict(size=10)
             ),
-            xaxis_rangeslider_visible=False,
             dragmode='zoom',
-            margin=dict(l=50, r=50, t=80, b=50)
+            margin=dict(l=50, r=50, t=80, b=50),
+            xaxis=dict(
+                rangeslider=dict(visible=False),
+                type='date',
+                gridcolor=grid_color,
+                showgrid=True,
+                gridwidth=0.5
+            ),
+            yaxis=dict(
+                gridcolor=grid_color,
+                showgrid=True,
+                gridwidth=0.5,
+                title_text='Price'
+            )
         )
         
-        # Update axes
-        for i in range(1, rows + 1):
-            fig.update_xaxes(
-                gridcolor='#2a2e39',
-                showgrid=True,
-                gridwidth=0.5,
-                zerolinecolor='#2a2e39',
-                row=i, col=1
-            )
-            fig.update_yaxes(
-                gridcolor='#2a2e39',
-                showgrid=True,
-                gridwidth=0.5,
-                zerolinecolor='#2a2e39',
-                row=i, col=1
-            )
+        if show_volume:
+            fig.update_yaxes(title_text="Volume", row=2, col=1, gridcolor=grid_color)
+        
+        # Add interactive buttons
+        fig.update_layout(
+            updatemenus=[
+                dict(
+                    type="buttons",
+                    direction="right",
+                    active=0,
+                    x=0.01,
+                    y=1.15,
+                    buttons=list([
+                        dict(label="Reset View",
+                             method="relayout",
+                             args=[{"xaxis.autorange": True, "yaxis.autorange": True}]),
+                        dict(label="Zoom In",
+                             method="relayout",
+                             args=[{"xaxis.range": [self.df.index[-50], self.df.index[-1]]}]),
+                        dict(label="Zoom Out",
+                             method="relayout",
+                             args=[{"xaxis.range": [self.df.index[-200], self.df.index[-1]]}])
+                    ])
+                )
+            ]
+        )
         
         return fig
 
 # ============================================================================
-# REAL-TIME PRICE DISPLAY
+# MARKET PHASE ANALYZER
 # ============================================================================
 
-def display_realtime_prices(data_manager: RealTimeDataManager, asset: str):
-    """Display real-time price information"""
+def analyze_market_phase(df: pd.DataFrame) -> Dict:
+    """Analyze market phase based on price action"""
+    if len(df) < 100:
+        return {'phase': 'Analyzing...', 'confidence': 0, 'trend': 'neutral'}
     
-    realtime = data_manager.get_realtime_price(asset)
+    # Calculate key metrics
+    sma_50 = df['SMA_50'].iloc[-1]
+    current_price = df['Close'].iloc[-1]
+    price_above_sma = current_price > sma_50
     
-    if realtime:
-        col1, col2, col3, col4, col5 = st.columns(5)
+    # Trend analysis
+    price_20d_ago = df['Close'].iloc[-20]
+    price_50d_ago = df['Close'].iloc[-50] if len(df) > 50 else price_20d_ago
+    
+    trend_strength = ((current_price - price_20d_ago) / price_20d_ago) * 100
+    long_trend = ((current_price - price_50d_ago) / price_50d_ago) * 100
+    
+    # Volatility analysis
+    atr = df['High'].iloc[-20:].max() - df['Low'].iloc[-20:].min()
+    volatility = atr / current_price * 100
+    
+    # Phase detection
+    if trend_strength > 2 and long_trend > 5:
+        phase = 'Markup'
+        confidence = min(0.9, 0.6 + trend_strength / 20)
+    elif trend_strength < -2 and long_trend < -5:
+        phase = 'Markdown'
+        confidence = min(0.9, 0.6 + abs(trend_strength) / 20)
+    elif abs(trend_strength) < 1 and volatility < 2:
+        # Check location
+        price_range = df['High'].iloc[-50:].max() - df['Low'].iloc[-50:].min()
+        price_position = (current_price - df['Low'].iloc[-50:].min()) / price_range
         
-        with col1:
-            price_color = '#00ff9d' if realtime['change'] >= 0 else '#ff4d4d'
-            st.markdown(f"""
-            <div style='background: rgba(255,255,255,0.05); padding: 10px; border-radius: 5px;'>
-                <small style='color: #888'>Current Price</small><br>
-                <span style='font-size: 24px; font-weight: bold; color: {price_color}'>${realtime['price']:.2f}</span>
-            </div>
-            """, unsafe_allow_html=True)
+        if price_position < 0.3:
+            phase = 'Accumulation'
+            confidence = 0.7 + (1 - price_position) * 0.3
+        elif price_position > 0.7:
+            phase = 'Distribution'
+            confidence = 0.7 + (price_position - 0.7) * 0.3
+        else:
+            phase = 'Consolidation'
+            confidence = 0.5
+    else:
+        phase = 'Transition'
+        confidence = 0.4
+    
+    # Liquidity sweep detection
+    liquidity_swept = False
+    if len(df) > 20:
+        recent_high = df['High'].iloc[-10:-1].max()
+        recent_low = df['Low'].iloc[-10:-1].min()
         
-        with col2:
-            st.markdown(f"""
-            <div style='background: rgba(255,255,255,0.05); padding: 10px; border-radius: 5px;'>
-                <small style='color: #888'>24h Change</small><br>
-                <span style='font-size: 18px; color: {price_color}'>{realtime['change']:+.2f}%</span>
-            </div>
-            """, unsafe_allow_html=True)
-        
-        with col3:
-            st.markdown(f"""
-            <div style='background: rgba(255,255,255,0.05); padding: 10px; border-radius: 5px;'>
-                <small style='color: #888'>Bid/Ask</small><br>
-                <span style='font-size: 14px'>${realtime['bid']:.2f} / ${realtime['ask']:.2f}</span>
-            </div>
-            """, unsafe_allow_html=True)
-        
-        with col4:
-            st.markdown(f"""
-            <div style='background: rgba(255,255,255,0.05); padding: 10px; border-radius: 5px;'>
-                <small style='color: #888'>24h Range</small><br>
-                <span style='font-size: 14px'>${realtime['low']:.2f} - ${realtime['high']:.2f}</span>
-            </div>
-            """, unsafe_allow_html=True)
-        
-        with col5:
-            st.markdown(f"""
-            <div style='background: rgba(255,255,255,0.05); padding: 10px; border-radius: 5px;'>
-                <small style='color: #888'>Volume</small><br>
-                <span style='font-size: 14px'>{realtime['volume']:,.0f}</span>
-            </div>
-            """, unsafe_allow_html=True)
-        
-        return realtime
-    return None
+        if df['High'].iloc[-1] > recent_high:
+            if df['Close'].iloc[-1] < df['Close'].iloc[-2]:
+                liquidity_swept = True
+        elif df['Low'].iloc[-1] < recent_low:
+            if df['Close'].iloc[-1] > df['Close'].iloc[-2]:
+                liquidity_swept = True
+    
+    # Structure break detection
+    structure_broken = False
+    if len(df) > 30:
+        if df['Close'].iloc[-1] > df['High'].iloc[-20:-1].max():
+            structure_broken = True
+        elif df['Close'].iloc[-1] < df['Low'].iloc[-20:-1].min():
+            structure_broken = True
+    
+    # Trend direction
+    if trend_strength > 1:
+        trend = 'bullish'
+    elif trend_strength < -1:
+        trend = 'bearish'
+    else:
+        trend = 'neutral'
+    
+    return {
+        'phase': phase,
+        'confidence': confidence,
+        'trend': trend,
+        'trend_strength': trend_strength,
+        'volatility': volatility,
+        'liquidity_swept': liquidity_swept,
+        'structure_broken': structure_broken,
+        'price_above_sma': price_above_sma
+    }
 
 # ============================================================================
-# MAIN APP
+# SUPPLY/DEMAND DETECTOR
+# ============================================================================
+
+def find_supply_demand(df: pd.DataFrame) -> Tuple[List[Dict], List[Dict]]:
+    """Find key supply and demand zones"""
+    supply = []
+    demand = []
+    
+    if len(df) < 50:
+        return supply, demand
+    
+    # Find swing points
+    swings_high = []
+    swings_low = []
+    
+    for i in range(5, len(df) - 5):
+        # Swing high
+        if df['High'].iloc[i] == df['High'].iloc[i-5:i+5].max():
+            swings_high.append({
+                'price': df['High'].iloc[i],
+                'index': i,
+                'volume': df['Volume'].iloc[i],
+                'time': df.index[i]
+            })
+        
+        # Swing low
+        if df['Low'].iloc[i] == df['Low'].iloc[i-5:i+5].min():
+            swings_low.append({
+                'price': df['Low'].iloc[i],
+                'index': i,
+                'volume': df['Volume'].iloc[i],
+                'time': df.index[i]
+            })
+    
+    # Identify demand zones (support)
+    for low in swings_low[-10:]:  # Last 10 swing lows
+        if low['volume'] > df['Volume'].iloc[max(0, low['index']-10):low['index']].mean():
+            zone = {
+                'price': low['price'],
+                'strength': min(1.0, low['volume'] / df['Volume'].mean()),
+                'time': low['time'],
+                'type': 'demand'
+            }
+            demand.append(zone)
+    
+    # Identify supply zones (resistance)
+    for high in swings_high[-10:]:  # Last 10 swing highs
+        if high['volume'] > df['Volume'].iloc[max(0, high['index']-10):high['index']].mean():
+            zone = {
+                'price': high['price'],
+                'strength': min(1.0, high['volume'] / df['Volume'].mean()),
+                'time': high['time'],
+                'type': 'supply'
+            }
+            supply.append(zone)
+    
+    # Sort by strength
+    supply.sort(key=lambda x: x['strength'], reverse=True)
+    demand.sort(key=lambda x: x['strength'], reverse=True)
+    
+    return supply[:3], demand[:3]  # Return top 3 zones
+
+# ============================================================================
+# A+ TRADE SETUP GENERATOR
+# ============================================================================
+
+def generate_trade_setups(df: pd.DataFrame, asset: str, phase_data: Dict) -> List[Dict]:
+    """Generate A+ trade setups based on the playbook"""
+    setups = []
+    
+    # Hard filters - MUST pass all
+    if phase_data['confidence'] < 0.6:
+        return setups
+    
+    if not phase_data['liquidity_swept']:
+        return setups
+    
+    if not phase_data['structure_broken']:
+        return setups
+    
+    current_price = df['Close'].iloc[-1]
+    supply_zones, demand_zones = find_supply_demand(df)
+    
+    # Calculate ATR for stop loss
+    atr = (df['High'].iloc[-20:].max() - df['Low'].iloc[-20:].min()) / 2
+    
+    # LONG SETUP
+    if phase_data['trend'] in ['bullish', 'neutral'] and phase_data['phase'] in ['Accumulation', 'Markup']:
+        if demand_zones:
+            best_demand = demand_zones[0]
+            
+            # Check if price is near demand zone
+            distance = abs(current_price - best_demand['price']) / current_price
+            
+            if distance < 0.02:  # Within 2%
+                entry = current_price
+                stop = best_demand['price'] - atr * 0.5
+                target = best_demand['price'] + atr * 2
+                
+                risk = entry - stop
+                reward = target - entry
+                
+                if risk > 0 and reward / risk >= 2:
+                    setups.append({
+                        'direction': 'LONG',
+                        'entry': entry,
+                        'stop': stop,
+                        'target': target,
+                        'rr': reward / risk,
+                        'confidence': phase_data['confidence'],
+                        'zone': best_demand['price']
+                    })
+    
+    # SHORT SETUP
+    elif phase_data['trend'] in ['bearish', 'neutral'] and phase_data['phase'] in ['Distribution', 'Markdown']:
+        if supply_zones:
+            best_supply = supply_zones[0]
+            
+            # Check if price is near supply zone
+            distance = abs(current_price - best_supply['price']) / current_price
+            
+            if distance < 0.02:  # Within 2%
+                entry = current_price
+                stop = best_supply['price'] + atr * 0.5
+                target = best_supply['price'] - atr * 2
+                
+                risk = stop - entry
+                reward = entry - target
+                
+                if risk > 0 and reward / risk >= 2:
+                    setups.append({
+                        'direction': 'SHORT',
+                        'entry': entry,
+                        'stop': stop,
+                        'target': target,
+                        'rr': reward / risk,
+                        'confidence': phase_data['confidence'],
+                        'zone': best_supply['price']
+                    })
+    
+    return setups
+
+# ============================================================================
+# TELEGRAM ALERT SYSTEM
+# ============================================================================
+
+def send_telegram_alert(bot_token: str, chat_id: str, setup: Dict, asset: str) -> bool:
+    """Send trade alert via Telegram"""
+    if not bot_token or not chat_id or bot_token == 'YOUR_BOT_TOKEN':
+        return False
+    
+    emoji = "🟢" if setup['direction'] == 'LONG' else "🔴"
+    
+    message = f"""
+{emoji} <b>A+ TRADE SIGNAL</b>
+━━━━━━━━━━━━━━━━━━━
+
+<b>Asset:</b> {asset}
+<b>Direction:</b> {setup['direction']}
+<b>Entry:</b> ${setup['entry']:.2f}
+<b>Stop Loss:</b> ${setup['stop']:.2f}
+<b>Take Profit:</b> ${setup['target']:.2f}
+
+<b>Risk/Reward:</b> 1:{setup['rr']:.1f}
+<b>Confidence:</b> {setup['confidence']:.0%}
+
+━━━━━━━━━━━━━━━━━━━
+<i>"Discipline over emotion"</i>
+"""
+    
+    try:
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        payload = {'chat_id': chat_id, 'text': message, 'parse_mode': 'HTML'}
+        response = requests.post(url, json=payload, timeout=10)
+        return response.status_code == 200
+    except:
+        return False
+
+# ============================================================================
+# MAIN APPLICATION
 # ============================================================================
 
 def main():
     st.set_page_config(
-        page_title="A+ Trading System - Professional Edition",
+        page_title="A+ Trading Platform",
         page_icon="🎯",
         layout="wide",
         initial_sidebar_state="expanded"
     )
     
-    # Custom CSS
+    # Custom CSS for professional look
     st.markdown("""
     <style>
     .stApp {
-        background-color: #131722;
+        background-color: #0e0f1a;
     }
     .main-header {
-        background: linear-gradient(135deg, #1e2a3a 0%, #0f172a 100%);
-        padding: 20px;
+        background: linear-gradient(135deg, #1a1f2e 0%, #0a0e1a 100%);
+        padding: 15px;
         border-radius: 10px;
         margin-bottom: 20px;
+        border-bottom: 2px solid #00ff9d;
+    }
+    .metric-card {
+        background: rgba(20, 25, 40, 0.8);
+        border-radius: 8px;
+        padding: 12px;
+        border-left: 3px solid #00ff9d;
+    }
+    .price-up {
+        color: #00ff9d;
+        font-weight: bold;
+    }
+    .price-down {
+        color: #ff4d4d;
+        font-weight: bold;
     }
     </style>
     """, unsafe_allow_html=True)
@@ -1043,94 +582,144 @@ def main():
     # Header
     st.markdown("""
     <div class="main-header">
-        <h1 style="color: #00ff9d; margin: 0;">🎯 A+ Trading System</h1>
-        <p style="color: #d1d4dc; margin: 0;">Professional Market Phase & Supply-Demand Trading Platform</p>
+        <h1 style="color: #00ff9d; margin: 0;">🎯 A+ Trading Platform</h1>
+        <p style="color: #8a8f9a; margin: 0;">Professional Market Analysis & Execution</p>
     </div>
     """, unsafe_allow_html=True)
     
-    # Sidebar
+    # Initialize data stream
+    data_stream = RealTimeDataStream()
+    
+    # Sidebar - Trading Controls
     with st.sidebar:
-        st.markdown("### ⚙️ Trading Configuration")
+        st.markdown("### 📊 Trading Controls")
         
-        asset = st.selectbox("Select Asset", list(ASSETS.keys()))
+        # Asset selection
+        asset = st.selectbox("Asset", list(ASSETS.keys()))
+        
+        # Timeframe selection
         timeframe = st.selectbox("Timeframe", list(TIMEFRAMES.keys()))
-        period = st.selectbox("Data Period", ['1d', '5d', '1mo', '3mo', '6mo', '1y'])
         
         st.markdown("---")
         
-        # Chart settings
-        st.markdown("### 📊 Chart Settings")
-        show_indicators = st.checkbox("Show All Indicators", value=True)
+        # Chart Controls
+        st.markdown("### 🎨 Chart Settings")
+        chart_type = st.selectbox("Chart Type", ['candlestick', 'line', 'area'])
+        show_sma = st.checkbox("Show SMA 50", value=True)
+        show_volume = st.checkbox("Show Volume", value=True)
+        chart_theme = st.selectbox("Theme", ['dark', 'light'])
+        
+        st.markdown("---")
+        
+        # Analysis Tools
+        st.markdown("### 🔧 Analysis Tools")
         show_supply_demand = st.checkbox("Show Supply/Demand Zones", value=True)
         
         st.markdown("---")
         
-        # Telegram settings
-        st.markdown("### 📱 Telegram Alerts")
+        # Telegram Integration
+        st.markdown("### 📱 Alerts")
         use_telegram = st.checkbox("Enable Telegram Alerts")
         bot_token = st.text_input("Bot Token", type="password", value="YOUR_BOT_TOKEN")
         chat_id = st.text_input("Chat ID", value="YOUR_CHAT_ID")
         
         st.markdown("---")
         
-        # Real-time settings
-        st.markdown("### 🔄 Real-time Settings")
-        auto_refresh = st.checkbox("Auto-refresh (5 seconds)", value=True)
+        # Auto-refresh
+        auto_refresh = st.checkbox("Auto-refresh (5s)", value=False)
         
         st.markdown("---")
-        st.markdown("### 📖 Trading Rules")
-        with st.expander("A+ Setup Requirements"):
+        
+        # Trading Rules
+        with st.expander("📖 A+ Trading Rules"):
             st.markdown("""
-            ✅ **Hard Filters:**
-            1. HTF context clear
-            2. Correct location (discount/premium)
-            3. Liquidity taken
-            4. Structure break
-            5. Fresh supply/demand zone
+            **A+ Setup Requirements:**
+            1. Clear market phase (confidence > 60%)
+            2. Correct location (discount for longs, premium for shorts)
+            3. Liquidity swept
+            4. Structure break confirmed
+            5. Minimum 1:2 risk-reward
             
-            🎯 **Risk Management:**
-            - Minimum 1:2 risk-reward
-            - Maximum 2% risk per trade
+            **Risk Management:**
+            - Never risk more than 2% per trade
+            - Use hard stops
+            - Let winners run
             """)
     
-    # Initialize data manager
-    data_manager = RealTimeDataManager()
+    # Real-time quote
+    st.markdown("### 💹 Live Market Data")
     
-    # Real-time price display
-    st.markdown("### 💹 Real-time Market Data")
-    display_realtime_prices(data_manager, asset)
+    quote = data_stream.get_realtime_quote(asset)
+    if quote:
+        col1, col2, col3, col4, col5 = st.columns(5)
+        
+        with col1:
+            price_color = "price-up" if quote['change'] >= 0 else "price-down"
+            st.markdown(f"""
+            <div class="metric-card">
+                <small>Current Price</small><br>
+                <span class="{price_color}" style="font-size: 24px;">${quote['price']:.2f}</span>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col2:
+            change_color = "price-up" if quote['change'] >= 0 else "price-down"
+            st.markdown(f"""
+            <div class="metric-card">
+                <small>24h Change</small><br>
+                <span class="{change_color}" style="font-size: 18px;">{quote['change']:+.2f}%</span>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col3:
+            st.markdown(f"""
+            <div class="metric-card">
+                <small>Bid/Ask</small><br>
+                <span>${quote['bid']:.2f} / ${quote['ask']:.2f}</span>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col4:
+            st.markdown(f"""
+            <div class="metric-card">
+                <small>24h Range</small><br>
+                <span>${quote['low']:.2f} - ${quote['high']:.2f}</span>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col5:
+            st.markdown(f"""
+            <div class="metric-card">
+                <small>Volume</small><br>
+                <span>{quote['volume']:,.0f}</span>
+            </div>
+            """, unsafe_allow_html=True)
     
-    # Fetch historical data
+    st.markdown("---")
+    
+    # Fetch data
     with st.spinner(f"Loading {asset} data..."):
-        df = data_manager.get_historical_data(asset, TIMEFRAMES[timeframe], period)
+        df = data_stream.stream_data(asset)
+        
+        if df.empty:
+            st.error("Failed to load data. Please check your connection.")
+            return
     
-    if df.empty:
-        st.error("Failed to fetch data. Please check your internet connection.")
-        return
+    # Analyze market
+    phase_data = analyze_market_phase(df)
+    supply_zones, demand_zones = find_supply_demand(df)
+    setups = generate_trade_setups(df, asset, phase_data)
     
-    # Add returns column if not present
-    if 'Returns' not in df.columns:
-        df['Returns'] = df['Close'].pct_change()
-    
-    # Market analysis
-    phase_data = detect_market_phase(df)
-    supply_zones, demand_zones = find_enhanced_zones(df)
-    setups = generate_enhanced_setups(df, asset, phase_data)
-    
-    # Order flow analysis
-    analyzer = MarketAnalyzer(df)
-    order_flow = analyzer.detect_order_flow()
-    
-    # Market metrics row
-    col1, col2, col3, col4, col5, col6 = st.columns(6)
+    # Market metrics
+    col1, col2, col3, col4, col5 = st.columns(5)
     
     with col1:
         st.metric("Market Phase", phase_data['phase'], 
                  delta=f"{phase_data['confidence']:.0%} confidence")
     
     with col2:
-        st.metric("Location", phase_data['location'].upper(),
-                 delta=f"{phase_data['price_position']:.0%} of range")
+        st.metric("Trend", phase_data['trend'].upper(),
+                 delta=f"{phase_data['trend_strength']:+.1f}%")
     
     with col3:
         st.metric("Liquidity Swept", "✅" if phase_data['liquidity_swept'] else "❌")
@@ -1139,120 +728,161 @@ def main():
         st.metric("Structure Break", "✅" if phase_data['structure_broken'] else "❌")
     
     with col5:
-        absorption_emoji = "✅" if order_flow.get('absorption') else "❌"
-        st.metric("Absorption", absorption_emoji)
-    
-    with col6:
-        exhaustion_emoji = "✅" if order_flow.get('exhaustion') else "❌"
-        st.metric("Exhaustion", exhaustion_emoji)
+        st.metric("Volatility", f"{phase_data['volatility']:.1f}%")
     
     st.markdown("---")
     
-    # Professional TradingView-style chart
-    chart = TradingViewChart(df, asset)
-    fig = chart.create_candlestick_chart(
-        supply_zones if show_supply_demand else None,
-        demand_zones if show_supply_demand else None,
-        setups,
-        show_indicators
+    # Professional Chart
+    chart_engine = ProfessionalChart(df, asset)
+    chart_engine.chart_theme = chart_theme
+    
+    fig = chart_engine.create_chart(
+        show_sma=show_sma,
+        show_volume=show_volume,
+        chart_type=chart_type
     )
     
-    st.plotly_chart(fig, use_container_width=True)
+    # Add supply/demand zones if enabled
+    if show_supply_demand:
+        for zone in supply_zones:
+            fig.add_hline(
+                y=zone['price'],
+                line_dash="dash",
+                line_color="#ff3366",
+                opacity=0.5,
+                annotation_text=f"Supply {zone['strength']:.0%}",
+                annotation_position="top right"
+            )
+        
+        for zone in demand_zones:
+            fig.add_hline(
+                y=zone['price'],
+                line_dash="dash",
+                line_color="#33ff66",
+                opacity=0.5,
+                annotation_text=f"Demand {zone['strength']:.0%}",
+                annotation_position="bottom right"
+            )
     
-    # Trade setups section
+    st.plotly_chart(fig, use_container_width=True, config={
+        'scrollZoom': True,
+        'displayModeBar': True,
+        'modeBarButtonsToAdd': ['drawline', 'drawrect', 'eraseshape']
+    })
+    
+    # Chart controls info
+    st.info("💡 **Chart Controls:** Scroll to zoom | Drag to pan | Double-click to reset | Use drawing tools from toolbar")
+    
     st.markdown("---")
+    
+    # Trade Setups
     st.markdown("### 🎯 A+ Trade Setups")
     
     if setups:
         for i, setup in enumerate(setups):
-            with st.container():
-                cols = st.columns([1, 2, 2, 2, 1])
-                
+            cols = st.columns([1, 2, 2, 2, 1])
+            
+            with cols[0]:
                 direction_color = "#00ff9d" if setup['direction'] == 'LONG' else "#ff4d4d"
-                
-                with cols[0]:
-                    st.markdown(f"""
-                    <div style="background: {direction_color}20; padding: 10px; border-radius: 5px; text-align: center;">
-                        <span style="font-size: 24px;">{'🟢' if setup['direction'] == 'LONG' else '🔴'}</span><br>
-                        <span style="font-weight: bold; color: {direction_color};">{setup['direction']}</span>
-                    </div>
-                    """, unsafe_allow_html=True)
-                
-                with cols[1]:
-                    st.markdown(f"""
-                    **Entry:** ${setup['entry']:.2f}<br>
-                    **Stop:** ${setup['stop_loss']:.2f}<br>
-                    **Risk:** ${abs(setup['entry'] - setup['stop_loss']):.2f}
-                    """, unsafe_allow_html=True)
-                
-                with cols[2]:
-                    st.markdown(f"""
-                    **Target 1:** ${setup['take_profit']:.2f}<br>
-                    **Target 2:** ${setup['take_profit_2']:.2f}<br>
-                    **Reward:** ${abs(setup['take_profit'] - setup['entry']):.2f}
-                    """, unsafe_allow_html=True)
-                
-                with cols[3]:
-                    st.markdown(f"""
-                    **R:R:** 1:{setup['risk_reward']:.1f}<br>
-                    **Confidence:** {setup['confidence']:.0%}<br>
-                    **Zone Strength:** {setup['zone_strength']:.0%}
-                    """, unsafe_allow_html=True)
-                
-                with cols[4]:
-                    if use_telegram and bot_token != 'YOUR_BOT_TOKEN':
-                        if st.button(f"🚀 Execute", key=f"exec_{i}"):
-                            if send_telegram_alert(bot_token, chat_id, setup, asset):
-                                st.success("Alert sent to Telegram!")
-                
-                st.markdown("---")
+                st.markdown(f"""
+                <div style="text-align: center; padding: 10px; background: {direction_color}10; border-radius: 8px;">
+                    <span style="font-size: 28px;">{'🟢' if setup['direction'] == 'LONG' else '🔴'}</span><br>
+                    <span style="color: {direction_color}; font-weight: bold;">{setup['direction']}</span>
+                </div>
+                """, unsafe_allow_html=True)
+            
+            with cols[1]:
+                st.markdown(f"""
+                **Entry:** ${setup['entry']:.2f}<br>
+                **Stop:** ${setup['stop']:.2f}<br>
+                **Risk:** ${abs(setup['entry'] - setup['stop']):.2f}
+                """)
+            
+            with cols[2]:
+                st.markdown(f"""
+                **Target:** ${setup['target']:.2f}<br>
+                **Reward:** ${abs(setup['target'] - setup['entry']):.2f}<br>
+                **R:R:** 1:{setup['rr']:.1f}
+                """)
+            
+            with cols[3]:
+                st.markdown(f"""
+                **Confidence:** {setup['confidence']:.0%}<br>
+                **Zone:** ${setup['zone']:.2f}<br>
+                **Status:** Ready
+                """)
+            
+            with cols[4]:
+                if use_telegram and bot_token != 'YOUR_BOT_TOKEN':
+                    if st.button(f"🚀 Execute", key=f"exec_{i}"):
+                        if send_telegram_alert(bot_token, chat_id, setup, asset):
+                            st.success("✅ Alert sent!")
+                            st.balloons()
+                        else:
+                            st.error("❌ Failed to send")
+                else:
+                    st.button(f"📋 Copy", key=f"copy_{i}")
+            
+            st.markdown("---")
     else:
-        st.info("🔍 No A+ setups detected. Waiting for market to invite you...")
+        st.info("🔍 No A+ setups detected. Waiting for market conditions...")
         
         # Show what's missing
         missing = []
         if phase_data['confidence'] < 0.6:
-            missing.append("HTF context not clear")
+            missing.append("Market phase not clear")
         if not phase_data['liquidity_swept']:
             missing.append("No liquidity sweep")
         if not phase_data['structure_broken']:
             missing.append("No structure break")
-        if phase_data['location'] not in ['discount', 'premium']:
-            missing.append("Wrong location")
         
         if missing:
             st.warning(f"**Missing A+ Criteria:** {', '.join(missing)}")
+    
+    # Key levels
+    st.markdown("---")
+    st.markdown("### 📊 Key Market Levels")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("#### 🔴 Supply Zones (Resistance)")
+        for zone in supply_zones:
+            st.write(f"• ${zone['price']:.2f} - Strength: {zone['strength']:.0%}")
+        if not supply_zones:
+            st.write("No significant supply zones detected")
+    
+    with col2:
+        st.markdown("#### 🟢 Demand Zones (Support)")
+        for zone in demand_zones:
+            st.write(f"• ${zone['price']:.2f} - Strength: {zone['strength']:.0%}")
+        if not demand_zones:
+            st.write("No significant demand zones detected")
     
     # Market insights
     st.markdown("---")
     st.markdown("### 📈 Market Insights")
     
-    col1, col2 = st.columns(2)
+    insight_col1, insight_col2 = st.columns(2)
     
-    with col1:
-        st.markdown("#### 🔄 Order Flow Analysis")
-        if order_flow.get('absorption'):
-            st.success("✅ **Absorption Detected** - Large players absorbing selling pressure")
-        if order_flow.get('exhaustion'):
-            st.warning("⚠️ **Exhaustion Detected** - Momentum may be running out")
-        if order_flow.get('accumulation'):
-            st.success("✅ **Accumulation Detected** - Institutional buying present")
-        if order_flow.get('distribution'):
-            st.warning("⚠️ **Distribution Detected** - Institutional selling present")
-        
-        if not any(order_flow.values()):
-            st.info("No significant order flow signals detected")
+    with insight_col1:
+        st.markdown("**Current Conditions:**")
+        st.write(f"• Price is {'above' if phase_data['price_above_sma'] else 'below'} SMA 50")
+        st.write(f"• Trend strength: {abs(phase_data['trend_strength']):.1f}%")
+        st.write(f"• Market phase: {phase_data['phase']}")
     
-    with col2:
-        st.markdown("#### 📊 Key Levels")
-        if supply_zones:
-            st.write(f"**Strongest Supply:** ${supply_zones[0]['price']:.2f} (Strength: {supply_zones[0]['strength']:.0%})")
-        if demand_zones:
-            st.write(f"**Strongest Demand:** ${demand_zones[0]['price']:.2f} (Strength: {demand_zones[0]['strength']:.0%})")
-        
-        st.write(f"**Current Price:** ${df['Close'].iloc[-1]:.2f}")
-        if 'ATR' in df.columns:
-            st.write(f"**ATR (14):** ${df['ATR'].iloc[-1]:.2f}")
+    with insight_col2:
+        st.markdown("**Trading Recommendations:**")
+        if phase_data['phase'] == 'Accumulation':
+            st.success("✅ Look for LONG setups at demand zones")
+        elif phase_data['phase'] == 'Distribution':
+            st.warning("⚠️ Look for SHORT setups at supply zones")
+        elif phase_data['phase'] == 'Markup':
+            st.success("✅ Trend is your friend - look for pullbacks to enter LONG")
+        elif phase_data['phase'] == 'Markdown':
+            st.warning("⚠️ Wait for distribution before entering SHORT")
+        else:
+            st.info("⏸️ Consolidation - wait for clear direction")
     
     # Auto-refresh
     if auto_refresh:
